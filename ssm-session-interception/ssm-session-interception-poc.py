@@ -11,7 +11,17 @@ def retrieve_meta() -> json:
 
 
 def retrieve_role_name():
-    resp = requests.get("http://169.254.169.254/latest/meta-data/iam/security-credentials/")
+    # Obtain the IMDSv2 token
+    headers = {"X-aws-ec2-metadata-token-ttl-seconds": "21600"}
+    resp = requests.put("http://169.254.169.254/latest/api/token", headers=headers)
+    if resp.status_code != 200:
+        raise Exception(f"Failed to retrieve metadata token: HTTP {resp.status_code}")
+    api_token = resp.text
+    print(f"Retrieved IMDSv2 token: {api_token}")
+
+    # Use the token to get the IAM role name
+    headers = {"X-aws-ec2-metadata-token": api_token}
+    resp = requests.get("http://169.254.169.254/latest/meta-data/iam/security-credentials/", headers=headers)
     if resp.status_code != 200:
         raise Exception(f"Failed to retrieve IAM role name: HTTP {resp.status_code}")
     role_name = resp.text.strip()
@@ -19,6 +29,7 @@ def retrieve_role_name():
         raise Exception("No IAM role name returned from metadata service.")
     print(f"Retrieved IAM role name: '{role_name}'")
     return role_name
+
 
 
 
