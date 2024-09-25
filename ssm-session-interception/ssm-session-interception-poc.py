@@ -10,19 +10,41 @@ def retrieve_meta() -> json:
     return json.loads(resp.text)
 
 
-def retrieve_role_name() -> str:
+def retrieve_role_name():
     resp = requests.get("http://169.254.169.254/latest/meta-data/iam/security-credentials/")
-    return resp.text
+    if resp.status_code != 200:
+        raise Exception(f"Failed to retrieve IAM role name: HTTP {resp.status_code}")
+    role_name = resp.text.strip()
+    if not role_name:
+        raise Exception("No IAM role name returned from metadata service.")
+    print(f"Retrieved IAM role name: '{role_name}'")
+    return role_name
 
 
-def retrieve_role_creds(role_name) -> json:
-    headers = { "X-Aws-Ec2-Metadata-Token-Ttl-Seconds": "21600" }
+
+def retrieve_role_creds(role_name):
+    # Requesting IMDSv2 token
+    headers = {"X-aws-ec2-metadata-token-ttl-seconds": "21600"}
     resp = requests.put("http://169.254.169.254/latest/api/token", headers=headers)
+    if resp.status_code != 200:
+        raise Exception(f"Failed to retrieve metadata token: HTTP {resp.status_code}")
     api_token = resp.text
+    print(f"Retrieved IMDSv2 token: {api_token}")
 
-    headers = { "X-Aws-Ec2-Metadata-Token": api_token }
-    resp = requests.get("http://169.254.169.254/latest/meta-data/iam/security-credentials/"+role_name, headers=headers)
+    # Using token to get role credentials
+    headers = {"X-aws-ec2-metadata-token": api_token}
+    url = f"http://169.254.169.254/latest/meta-data/iam/security-credentials/{role_name}"
+    resp = requests.get(url, headers=headers)
+    print(f"Requesting role credentials from: {url}")
+    print(f"Response status code: {resp.status_code}")
+    print(f"Response text: '{resp.text}'")
+
+    if resp.status_code != 200:
+        raise Exception(f"Failed to retrieve role credentials: HTTP {resp.status_code}")
+    if not resp.text.strip():
+        raise Exception("No role credentials returned from metadata service.")
     return json.loads(resp.text)
+
 
 
 def retrieve_role_creds_from_file(file_name):
@@ -118,6 +140,7 @@ def craft_output_stream_data(message, seq_num):
 
 # Get role name and credentials
 role_name = retrieve_role_name()
+print(role_name)
 role_creds = retrieve_role_creds(role_name)
 meta = retrieve_meta()
 
