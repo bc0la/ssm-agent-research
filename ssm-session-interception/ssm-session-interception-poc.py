@@ -4,10 +4,30 @@ import requests, json, time, uuid
 import websocket
 import aws_requests
 import aws_msg
+import boto3
+import sys
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+import base64
 
-def retrieve_meta() -> json:
-    resp = requests.get("http://169.254.169.254/latest/dynamic/instance-identity/document")
+def retrieve_meta():
+    # Step 1: Obtain the IMDSv2 token
+    headers = {"X-aws-ec2-metadata-token-ttl-seconds": "21600"}
+    resp = requests.put("http://169.254.169.254/latest/api/token", headers=headers)
+    if resp.status_code != 200:
+        raise Exception(f"Failed to retrieve metadata token: HTTP {resp.status_code}")
+    api_token = resp.text
+    print(f"Retrieved IMDSv2 token: {api_token}")
+
+    # Step 2: Use the token to get the instance identity document
+    headers = {"X-aws-ec2-metadata-token": api_token}
+    resp = requests.get("http://169.254.169.254/latest/dynamic/instance-identity/document", headers=headers)
+    if resp.status_code != 200:
+        raise Exception(f"Failed to retrieve instance identity document: HTTP {resp.status_code}")
+    print(f"Retrieved instance identity document: {resp.text}")
+
     return json.loads(resp.text)
+
 
 
 def retrieve_role_name():
@@ -148,85 +168,120 @@ def craft_output_stream_data(message, seq_num):
             1)                                                                                  # Payload Type
     return msg
 
+def decrypt_data_key(kms_client, encrypted_data_key_b64):
+    encrypted_data_key = base64.b64decode(encrypted_data_key_b64)
+    response = kms_client.decrypt(
+        CiphertextBlob=encrypted_data_key
+    )
+    return response['Plaintext']
 
-# Get role name and credentials
-role_name = retrieve_role_name()
-print(role_name)
-role_creds = retrieve_role_creds(role_name)
-meta = retrieve_meta()
+def encrypt_with_data_key(data_key, plaintext_bytes):
+    cipher = AES.new(data_key, AES.MODE_CBC, iv=b'\x00' * 16)
+    padded_plaintext = pad(plaintext_bytes, AES.block_size)
+    ciphertext = cipher.encrypt(padded_plaintext)
+    return ciphertext
 
-# Gather info to create the control channel
-access_token, url = fetch_access_token_url(meta, role_creds)
-cc_info = build_control_channel(meta, role_creds, access_token, url)
+def decrypt_with_data_key(data_key, ciphertext):
+    cipher = AES.new(data_key, AES.MODE_CBC, iv=b'\x00' * 16)
+    plaintext_padded = cipher.decrypt(ciphertext)
+    plaintext = unpad(plaintext_padded, AES.block_size)
+    return plaintext
 
-# Instantiate the control channel
-control_channel = websocket.WebSocket()
-control_channel.connect(cc_info[0], header=cc_info[1])
+def main(kms_key_arn, region):
+    # Initialize KMS client
+    kms_client = boto3.client('kms', region_name=region)
 
-# Get control channel session_id
-control_channel.send(craft_cc_message(access_token))
-first_response = aws_msg.deserialize(control_channel.recv())
-first_response_payload = json.loads(first_response.payload)
-first_response_content = json.loads(first_response_payload['content'])
-session_id = first_response_content['SessionId']
+    # Get role name and credentials
+    role_name = retrieve_role_name()
+    print("Retrieved role name:", role_name)
+    role_creds = retrieve_role_creds(role_name)
+    meta = retrieve_meta()
 
-# Gather info to create the data channel
-resp = aws_requests.post_data_channel(session_id, role_creds['AccessKeyId'], role_creds['SecretAccessKey'], role_creds['Token'])
-access_token = parse_data_channel(resp)
+    # Gather info to create the control channel
+    access_token, url = fetch_access_token_url(meta, role_creds)
+    cc_info = build_control_channel(meta, role_creds, access_token, url)
 
-dc_info = build_data_channel(session_id, access_token, role_creds)
+    # Instantiate the control channel
+    control_channel = websocket.WebSocket()
+    control_channel.connect(cc_info[0], header=cc_info[1])
 
-# Instantiate the data channel
-data_channel = websocket.WebSocket()
-data_channel.connect(dc_info[0], header=dc_info[1])
+    # Get control channel session_id
+    control_channel.send(craft_cc_message(access_token))
+    first_response = aws_msg.deserialize(control_channel.recv())
+    first_response_payload = json.loads(first_response.payload)
+    first_response_content = json.loads(first_response_payload['content'])
+    session_id = first_response_content['SessionId']
+    print("Session ID:", session_id)
 
-data_channel.send(craft_dc_message(access_token))
+    # Gather info to create the data channel
+    resp = aws_requests.post_data_channel(session_id, role_creds['AccessKeyId'], role_creds['SecretAccessKey'], role_creds['Token'])
+    access_token = parse_data_channel(resp)
 
-# From here on out we need to react to responses and send what we want
-# We react by looking at what the message type is
-data_channel.send_binary(craft_agent_session_state(first_response_content['SessionId']))
-msg = craft_output_stream_data("$ ", 0)
-data_channel.send_binary(msg)
+    dc_info = build_data_channel(session_id, access_token, role_creds)
 
+    # Instantiate the data channel
+    data_channel = websocket.WebSocket()
+    data_channel.connect(dc_info[0], header=dc_info[1])
 
-msg = aws_msg.deserialize(data_channel.recv())
-msg = aws_msg.deserialize(data_channel.recv())
+    data_channel.send(craft_dc_message(access_token))
 
-# acknowledge
-msg = craft_acknowledge(msg.messageId, 0)
-data_channel.send_binary(msg)
+    # Send agent session state
+    data_channel.send_binary(craft_agent_session_state(session_id))
 
-# output stream
-msg = craft_output_stream_data("$ ", 0)
-data_channel.send_binary(msg)
+    # Receive the encrypted data key from the server
+    msg = data_channel.recv()
+    msg_obj = aws_msg.deserialize(msg)
+    if msg_obj.messageType == 'key_exchange':
+        content = json.loads(msg_obj.payload)
+        encrypted_data_key_b64 = content['Parameters']['DataKey']
+        # Decrypt the data key using KMS
+        data_key = decrypt_data_key(kms_client, encrypted_data_key_b64)
+        print("Data key decrypted successfully.")
+    else:
+        print("Expected key_exchange message, got:", msg_obj.messageType)
+        sys.exit(1)
 
-msg = aws_msg.deserialize(data_channel.recv())
-sq_num = 1
-message = ""
+    # Now we can start sending and receiving encrypted messages
+    # Example: send output_stream_data message
+    output_message = craft_output_stream_data("$ ", 0)
+    # Encrypt the message using the data key
+    encrypted_output_message = encrypt_with_data_key(data_key, output_message)
+    data_channel.send_binary(encrypted_output_message)
 
-# Loop
-while True:
-    msg = aws_msg.deserialize(data_channel.recv())
+    # Initialize sequence number
+    seq_num = 1
+    message = ""
 
-    if "input" in msg.messageType and msg.sequenceNumber == sq_num:
-        payload = msg.payload.decode()
+    while True:
+        # Receive and decrypt message
+        encrypted_msg = data_channel.recv()
+        decrypted_msg = decrypt_with_data_key(data_key, encrypted_msg)
+        msg_obj = aws_msg.deserialize(decrypted_msg)
 
-        message = message + payload
-        msgid = msg.messageId
+        if msg_obj.messageType == 'input_stream_data' and msg_obj.sequenceNumber == seq_num:
+            payload = msg_obj.payload.decode()
+            message += payload
+            msg_id = msg_obj.messageId
 
-        msg = craft_acknowledge(msgid, sq_num)
-        aws_msg.deserialize(msg)
-        data_channel.send_binary(msg)
+            # Acknowledge
+            ack_msg = craft_acknowledge(msg_id, seq_num)
+            encrypted_ack_msg = encrypt_with_data_key(data_key, ack_msg)
+            data_channel.send_binary(encrypted_ack_msg)
 
-        if "\r" in payload:
-            payload = "\r\nlol no\r\n$ "
-        msg = craft_output_stream_data(payload, sq_num)
-        aws_msg.deserialize(msg)
-        data_channel.send_binary(msg)
-        sq_num += 1
+            # Process input and send response
+            if "\r" in payload:
+                response_payload = "\r\nCommand received\r\n$ "
+                output_msg = craft_output_stream_data(response_payload, seq_num)
+                encrypted_output_msg = encrypt_with_data_key(data_key, output_msg)
+                data_channel.send_binary(encrypted_output_msg)
+            seq_num += 1
 
-    # We can ignore acknowledge messages coming from AWS
+        print("Received message:", message)
 
-    print(message)
-
-
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: python script.py <kms_key_arn> <region>")
+        sys.exit(1)
+    kms_key_arn = sys.argv[1]
+    region = sys.argv[2]
+    main(kms_key_arn, region)
